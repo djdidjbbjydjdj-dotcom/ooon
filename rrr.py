@@ -6,7 +6,7 @@ import time
 from pyrogram import Client, filters, idle
 from pyrogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, InputFile
+    CallbackQuery
 )
 from pyrogram.errors import FloodWait, SessionPasswordNeeded
 
