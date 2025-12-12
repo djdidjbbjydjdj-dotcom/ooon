@@ -16,7 +16,7 @@ bot_token = "6872922603:AAEckw1ILOGNhq9fYQB8L-bK_DAHdSNCue0"
 owner_id = 6646631745
 
 # رابط الاتصال (تم تصحيحه)
-MONGO_URL = "mongodb+srv://djdidjbbjydjdj_db_user:d1JifOpzMkiL6Mkf@cluster0.gm4nvdj.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+MONGO_URL = "mongodb+srv://djdidjbbjydjdj_db_user:diJifopz@cluster0.gm4nvdj.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
 # --- [تعديل هام] إضافة certifi للاتصال الآمن ---
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(
