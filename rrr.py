@@ -7,7 +7,7 @@ from telethon.sessions import StringSession
 from datetime import datetime
 import os
 import motor.motor_asyncio
-import certifi #  ضروري لحل مشكلة SSL
+import certifi
 
 # --- إعدادات الاتصال ---
 api_id = 28557217
@@ -15,14 +15,18 @@ api_hash = "22fb694b8c569117cc056073fc444597"
 bot_token = "6872922603:AAEckw1ILOGNhq9fYQB8L-bK_DAHdSNCue0"
 owner_id = 6646631745
 
-# رابط الاتصال (تم تصحيحه)
-MONGO_URL = "mongodb+srv://djdidjbbjydjdj_db_user:diJifopz@cluster0.gm4nvdj.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+# رابط الاتصال
+MONGO_URL = "mongodb+srv://djdidjbbjydjdj_db_user:d1JifOpzMkiL6Mkf@cluster0.gm4nvdj.mongodb.net/?retryWrites=true&w=majority"
 
-# --- [تعديل هام] إضافة certifi للاتصال الآمن ---
+# --- [تعديل جذري] تجاوز مشاكل SSL ---
+# تم إضافة tlsAllowInvalidCertificates=True لحل مشكلة TLSV1_ALERT_INTERNAL_ERROR
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(
     MONGO_URL,
-    tlsCAFile=certifi.where()  # هذا السطر يحل مشكلة SSL handshake failed
+    tls=True,
+    tlsAllowInvalidCertificates=True,  # يسمح بالاتصال حتى لو فشل التحقق من الشهادة
+    serverSelectionTimeoutMS=5000      # تقليل وقت الانتظار عند الفشل
 )
+
 db = mongo_client["TelethonBotDB"]
 users_collection = db["users"]
 settings_collection = db["settings"]
@@ -40,9 +44,13 @@ async def load_data_from_db():
     """تحميل البيانات من القاعدة إلى الذاكرة عند التشغيل"""
     global users, vip_users, added_channels
     
-    print("جاري تحميل البيانات من MongoDB...")
+    print("جاري الاتصال بـ MongoDB...")
     
     try:
+        # فحص الاتصال أولاً
+        await mongo_client.admin.command('ping')
+        print("تم الاتصال بقاعدة البيانات بنجاح!")
+        
         # تحميل المستخدمين
         users = {}
         async for user in users_collection.find():
@@ -65,9 +73,10 @@ async def load_data_from_db():
             vip_users = []
             added_channels = []
             
-        print("تم تحميل البيانات بنجاح.")
+        print(f"تم تحميل {len(users)} مستخدم.")
     except Exception as e:
-        print(f"خطأ في الاتصال بقاعدة البيانات: {e}")
+        print(f"❌ فشل الاتصال بقاعدة البيانات: {e}")
+        print("تأكد من تفعيل Network Access: 0.0.0.0/0 في MongoDB Atlas")
 
 async def save_user(user_id):
     """حفظ بيانات مستخدم محدد في القاعدة"""
