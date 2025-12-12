@@ -1,577 +1,661 @@
-import os
-import sqlite3
 import asyncio
-import json
-import time
-from pyrogram import Client, filters, idle
-from pyrogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery
-)
-from pyrogram.errors import FloodWait, SessionPasswordNeeded
+from telethon.tl.types import Channel
+from telethon import TelegramClient, events, Button
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.errors import PhoneCodeInvalidError, PhoneNumberInvalidError, SessionPasswordNeededError, ChatAdminRequiredError, ChannelPrivateError, UserBannedInChannelError, FloodWaitError
+from telethon.sessions import StringSession
+from datetime import datetime
+import os
+import motor.motor_asyncio # مكتبة المونجو دي بي
 
-# --- 1. الإعدادات والثوابت ---
-# يجب تعيين هذه القيم في بيئة التشغيل أو تعديلها مباشرة هنا
-try:
-    API_ID = int(os.environ.get("API_ID", 28557217)) # ضع الآيدي الخاص بك
-    API_HASH = os.environ.get("API_HASH", "22fb694b8c569117cc056073fc444597") # ضع الهاش الخاص بك
-    BOT_TOKEN = os.environ.get("BOT_TOKEN", "8464576675:AAEcJZlWoJTo8kg2lbWbp0ucfqVltmfSI2o") # ضع توكن البوت
-    # ⚠️ مهم جداً: هذا الآيدي هو الذي يملك صلاحية المطور!
-    OWNER_ID = int(os.environ.get("OWNER_ID", 5858211211)) 
-except:
-    print("يرجى التأكد من تعيين متغيرات البيئة API_ID, API_HASH, BOT_TOKEN, OWNER_ID")
-    exit()
+# --- إعدادات الاتصال ---
+api_id = 28557217
+api_hash = "22fb694b8c569117cc056073fc444597"
+bot_token = "6872922603:AAEckw1ILOGNhq9fYQB8L-bK_DAHdSNCue0"
+owner_id = 6646631745
 
-DB_NAME = "auto_poster_bot.db"
+# رابط الاتصال بقاعدة البيانات (تم إزالة المسافة المتوقعة في كلمة المرور لضمان الاتصال)
+# اذا كانت كلمة المرور تحتوي مسافة بالفعل، اعدها كما كانت
+MONGO_URL = "mongodb+srv://djdidjbbjydjdj_db_user:d1JifOpzMkiL6Mkf@cluster0.gm4nvdj.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
-# --- 2. إدارة قاعدة البيانات (SQLite) ---
+# تهيئة عميل المونجو
+mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
+db = mongo_client["TelethonBotDB"] # اسم قاعدة البيانات
+users_collection = db["users"]
+settings_collection = db["settings"]
 
-def init_db():
-    """إنشاء الجداول اللازمة."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # جدول لتخزين بيانات الجلسة وإعدادات المستخدم
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            user_id INTEGER PRIMARY KEY,
-            session_name TEXT,
-            session_string TEXT,
-            cliche_text TEXT,
-            cliche_file_id TEXT, 
-            super_groups TEXT, 
-            delay_minutes INTEGER DEFAULT 5,
-            is_running BOOLEAN DEFAULT 0,
-            post_count INTEGER DEFAULT 0
-        )
-    """)
-    
-    # 🆕 جدول المستخدمين المصرح لهم (للسيطرة على الوصول)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS authorized_users (
-            user_id INTEGER PRIMARY KEY,
-            added_by INTEGER,
-            added_date DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # جدول للمطور (للاشتراك الإجباري والإعدادات العامة)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS developer_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    
-    conn.commit()
-    conn.close()
+bot = TelegramClient("bot", api_id, api_hash).start(bot_token=bot_token)
 
-def db_execute(query, params=(), fetchone=False, fetchall=False):
-    """دالة مساعدة لتنفيذ استعلامات DB."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(query, params)
+# --- متغيرات الذاكرة المؤقتة (Cache) ---
+# سيتم تحميل البيانات هنا عند تشغيل البوت لتقليل الضغط على القاعدة
+users = {}
+vip_users = []
+added_channels = []
+
+# --- دوال التعامل مع قاعدة البيانات ---
+
+async def load_data_from_db():
+    """تحميل البيانات من القاعدة إلى الذاكرة عند التشغيل"""
+    global users, vip_users, added_channels
     
-    if fetchone:
-        result = cursor.fetchone()
-    elif fetchall:
-        result = cursor.fetchall()
+    print("جاري تحميل البيانات من MongoDB...")
+    
+    # تحميل المستخدمين
+    users = {}
+    async for user in users_collection.find():
+        user_id = str(user["_id"])
+        users[user_id] = user
+        # تحويل القوائم والقيم الافتراضية إذا لم تكن موجودة
+        if "sessions" not in users[user_id]: users[user_id]["sessions"] = []
+        if "groups" not in users[user_id]: users[user_id]["groups"] = []
+    
+    # تحميل الإعدادات العامة (VIPs والقنوات)
+    settings = await settings_collection.find_one({"_id": "global_settings"})
+    if settings:
+        vip_users = settings.get("vip_users", [])
+        added_channels = settings.get("added_channels", [])
     else:
-        result = None
-        conn.commit()
+        # إنشاء مستند الإعدادات إذا لم يكن موجوداً
+        await settings_collection.insert_one({
+            "_id": "global_settings",
+            "vip_users": [],
+            "added_channels": []
+        })
+        vip_users = []
+        added_channels = []
         
-    conn.close()
-    return result
+    print("تم تحميل البيانات بنجاح.")
 
-def is_user_authorized(user_id):
-    """التحقق مما إذا كان المستخدم مصرحاً له."""
-    query = "SELECT 1 FROM authorized_users WHERE user_id = ?"
-    return db_execute(query, (user_id,), fetchone=True) is not None
+async def save_user(user_id):
+    """حفظ بيانات مستخدم محدد في القاعدة"""
+    user_id_str = str(user_id)
+    if user_id_str in users:
+        user_data = users[user_id_str].copy()
+        user_data["_id"] = int(user_id) # استخدام الـ ID كمفتاح أساسي
+        await users_collection.replace_one({"_id": int(user_id)}, user_data, upsert=True)
 
-def get_session_data(user_id):
-    """استرجاع بيانات الجلسة للمستخدم."""
-    query = "SELECT * FROM sessions WHERE user_id = ?"
-    return db_execute(query, (user_id,), fetchone=True)
-
-def update_session_data(user_id, **kwargs):
-    """تحديث بيانات الجلسة بشكل مرن."""
-    sets = ", ".join([f"{k} = ?" for k in kwargs.keys()])
-    values = list(kwargs.values())
-    values.append(user_id)
-    query = f"UPDATE sessions SET {sets} WHERE user_id = ?"
-    db_execute(query, tuple(values))
-
-# --- 3. تهيئة البوت والعملاء (Clients) ---
-
-app = Client(
-    "AutoPostBot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
-)
-
-# حالات لتسجيل الجلسات والإعدادات (بدل استخدام قاعدة بيانات مؤقتة)
-USER_STATE = {} # {user_id: 'step_name', ...}
-LOGIN_CLIENTS = {} # {user_id: temp_Client_object}
-
-# --- 4. الأزرار ولوحة التحكم ---
-
-def main_menu_markup():
-    """زر القائمة الرئيسية."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ إضافة جلسة تيليثون", callback_data="add_session")],
-        [InlineKeyboardButton("✍️ إضافة كليشة", callback_data="add_cliche"),
-         InlineKeyboardButton("📢 إضافة سوبرات", callback_data="add_supers")],
-        [InlineKeyboardButton("⏱️ ضبط وقت النشر", callback_data="set_delay"),
-         InlineKeyboardButton("▶️ بدء النشر / ⏹️ إيقاف", callback_data="toggle_posting")],
-        [InlineKeyboardButton("💾 تنزيل ملف تخزين", callback_data="download_storage"),
-         InlineKeyboardButton("🔄 تشغيل ملف تخزين", callback_data="upload_storage")],
-        [InlineKeyboardButton("🗑️ حذف تخزين", callback_data="delete_storage")]
-    ])
-
-def dev_menu_markup():
-    """لوحة المطور."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ إضافة مستخدم (تفعيل)", callback_data="dev_add_user"),
-         InlineKeyboardButton("➖ حذف مستخدم (تعطيل)", callback_data="dev_del_user")],
-        [InlineKeyboardButton("⚙️ إعدادات الإشتراك الإجباري", callback_data="dev_subscribe_settings")],
-        [InlineKeyboardButton("📢 إذاعة للمستخدمين", callback_data="dev_broadcast")],
-        [InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="back_to_main")]
-    ])
-
-# --- 5. معالجات الأوامر الرئيسية (Handlers) ---
-
-@app.on_message(filters.command("start") & filters.private)
-async def start_handler(client: Client, message: Message):
-    user_id = message.from_user.id
-    
-    # 🛑 فحص التحكم بالوصول: إذا لم يكن المالك ولم يكن مفعلًا، يتم الرفض 🛑
-    if user_id != OWNER_ID and not is_user_authorized(user_id):
-        await message.reply_text(
-            f"❌ **لا يمكنك استخدام البوت.**\n\nيجب على المطور تفعيل حسابك أولاً.\n\n**آيدي حسابك هو:** `{user_id}`"
-        )
-        return
-    
-    text = "أهلاً بك في بوت النشر التلقائي. اختر العملية المطلوبة:"
-    
-    # إضافة زر لوحة المطور إذا كان المستخدم هو المالك
-    markup = main_menu_markup().inline_keyboard
-    if user_id == OWNER_ID:
-        markup.append([InlineKeyboardButton("👑 لوحة المطور", callback_data="dev_panel")])
-    
-    await message.reply_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(markup)
+async def save_global_settings():
+    """حفظ إعدادات VIP والقنوات"""
+    await settings_collection.update_one(
+        {"_id": "global_settings"},
+        {"$set": {"vip_users": vip_users, "added_channels": added_channels}},
+        upsert=True
     )
 
-@app.on_callback_query()
-async def callback_handler(client: Client, query: CallbackQuery):
-    user_id = query.from_user.id
-    data = query.data
+def is_vip(user_id):
+    return user_id == owner_id or user_id in vip_users
+
+# --- القوائم والأزرار ---
+home_markup = [
+    [Button.inline("- الحسابات -", b"acc_mun")],
+    [Button.inline("- إدارة السوبرات -", b"manage_super"), Button.inline("- إعدادات النشر -", b"posting_settings")], 
+    [Button.inline("- تحكم المطور -", b"manage_vip")],
+]
+
+# --- بدء البوت ---
+@bot.on(events.NewMessage(pattern="/start"))
+async def start(event):
+    user_id = event.sender_id
+    user_id_str = str(user_id)
     
-    # 🛑 فحص التحكم بالوصول 🛑
-    if user_id != OWNER_ID and not is_user_authorized(user_id):
-        await query.answer("❌ لا تملك صلاحية استخدام البوت. يرجى مراجعة المطور.", show_alert=True)
-        return
-        
-    # --- أزرار الرجوع ---
-    if data == "back_to_main":
-        await query.edit_message_text(
-            "تم العودة إلى القائمة الرئيسية.",
-            reply_markup=main_menu_markup()
-        )
-        USER_STATE.pop(user_id, None)
-        return
-        
-    if data == "dev_panel":
-        await query.edit_message_text("مرحباً أيها المطور! اختر:", reply_markup=dev_menu_markup())
-        return
-
-    # --- لوحة المطور: إضافة مستخدم (تفعيل) ---
-    elif data == "dev_add_user" and user_id == OWNER_ID:
-        await query.edit_message_text(
-            "أرسل آيدي المستخدم (UserID) لتفعيله ومنحه صلاحية استخدام البوت:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="dev_panel")]])
-        )
-        USER_STATE[user_id] = 'dev_await_add_id'
-
-    # --- لوحة المطور: حذف مستخدم (تعطيل) ---
-    elif data == "dev_del_user" and user_id == OWNER_ID:
-        await query.edit_message_text(
-            "أرسل آيدي المستخدم (UserID) لحذفه وتعطيل صلاحية استخدام البوت:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="dev_panel")]])
-        )
-        USER_STATE[user_id] = 'dev_await_del_id'
-        
-    # --- باقي العمليات (إدارة الجلسات، الكليشة، إلخ) ---
-    # ... (نفس منطق الكود السابق)
-
-    # --- إدارة الجلسات (بدء التسجيل) ---
-    elif data == "add_session":
-        session_data = get_session_data(user_id)
-        if session_data:
-             await query.answer("لديك جلسة مسجلة بالفعل. يرجى حذفها أولاً.", show_alert=True)
-             return
-             
-        await query.edit_message_text(
-            "أرسل الآن رقم هاتفك مع رمز الدولة (مثال: +9647700000000):",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]])
-        )
-        USER_STATE[user_id] = 'await_phone'
-        
-    # --- إدارة الكليشة ---
-    elif data == "add_cliche":
-        await query.edit_message_text(
-            "أرسل الآن الكليشة (نص، صورة، فيديو) التي تريد نشرها تلقائياً. يمكنك إضافة علامات (مثال: #كلمات_غيابي):",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]])
-        )
-        USER_STATE[user_id] = 'await_cliche'
-    
-    # --- إدارة السوبرات ---
-    elif data == "add_supers":
-        await query.edit_message_text(
-            "أرسل أسماء المستخدمين (Usernames) أو معرفات (IDs) للسوبرات/القنوات التي تريد النشر فيها، مفصولة بسطر جديد (دفعة واحدة):\n\nمثال:\n@ChannelUsername\n-100123456789\n@AnotherChannel",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]])
-        )
-        USER_STATE[user_id] = 'await_supers'
-    
-    # --- ضبط الوقت ---
-    elif data == "set_delay":
-        await query.edit_message_text(
-            "أرسل عدد **الدقائق** التي تفصل بين كل عملية نشر (مثال: 5، 30، 60):",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]])
-        )
-        USER_STATE[user_id] = 'await_delay'
-        
-    # --- بدء/إيقاف النشر ---
-    elif data == "toggle_posting":
-        data = get_session_data(user_id)
-        if not data:
-            await query.answer("لم تقم بإضافة جلسة بعد.", show_alert=True)
-            return
-
-        is_running = data[7] # العمود الثامن
-        new_state = 1 if is_running == 0 else 0
-        
-        # التأكد من وجود كليشة وسوبرات قبل البدء
-        if new_state == 1 and (not data[3] and not data[4]):
-            await query.answer("لا يمكن بدء النشر. يرجى إضافة كليشة وسوبرات أولاً.", show_alert=True)
-            return
-            
-        update_session_data(user_id, is_running=new_state)
-        await query.answer(f"تم {'بدء' if new_state else 'إيقاف'} النشر التلقائي.", show_alert=True)
-        await query.edit_message_reply_markup(reply_markup=main_menu_markup())
-
-    # --- تنزيل ملف التخزين (String Session) ---
-    elif data == "download_storage":
-        session_data = get_session_data(user_id)
-        if not session_data or not session_data[2]: 
-            await query.answer("لا توجد جلسة نشطة لتنزيلها.", show_alert=True)
-            return
-            
-        session_string = session_data[2]
-        settings = {
-            "cliche": session_data[3],
-            "file_id": session_data[4],
-            "supers": session_data[5],
-            "delay": session_data[6]
+    # التحقق مما إذا كان المستخدم جديداً وإضافته
+    if user_id_str not in users:
+        users[user_id_str] = {
+            "_id": user_id,
+            "sessions": [], 
+            "groups": [], 
+            "posting": False, 
+            "caption_1": "",
+            "caption_2": "",
+            "caption_3": "", 
+            "caption_4": "",
+            "waitTime": 60
         }
-        
-        storage_content = f"SESSION_STRING:{session_string}\nSETTINGS:{json.dumps(settings)}"
-        
-        file_name = f"storage_{user_id}.txt"
-        with open(file_name, "w", encoding="utf-8") as f:
-            f.write(storage_content)
-            
-        await client.send_document(
-            user_id,
-            document=file_name,
-            caption="**ملف تخزين الجلسة والإعدادات الخاص بك.**\n\n**هام:** لا تشاركه مع أحد!"
-        )
-        os.remove(file_name)
-        await query.answer("تم إرسال ملف التخزين.", show_alert=True)
+        await save_user(user_id) # حفظ في القاعدة
 
-    # --- رفع ملف التخزين ---
-    elif data == "upload_storage":
-        await query.edit_message_text(
-            "أرسل الآن ملف التخزين (storage_USERID.txt) الذي قمت بتنزيله سابقاً:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]])
-        )
-        USER_STATE[user_id] = 'await_storage_file'
-
-    # --- حذف التخزين ---
-    elif data == "delete_storage":
-        # حذف بيانات الجلسة
-        db_execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
-        # ⚠️ (الإضافة المطلوبة) يتم تصفير كود الجلسة وبيانات التسجيل بالكامل
-        USER_STATE.pop(user_id, None)
-        
-        await query.answer("تم حذف الجلسة وكافة بيانات النشر الخاصة بك بنجاح.", show_alert=True)
-        await query.edit_message_reply_markup(reply_markup=main_menu_markup())
-        
-# --- 6. معالجة الردود (الـ States) ---
-
-@app.on_message(filters.private & (filters.text | filters.media) & filters.incoming)
-async def state_processor(client: Client, message: Message):
-    user_id = message.from_user.id
-    state = USER_STATE.get(user_id)
-    text = message.text
-
-    # 🛑 فحص التحكم بالوصول 🛑
-    if user_id != OWNER_ID and not is_user_authorized(user_id):
-        return
-
-    # --- معالجة لوحة المطور: إضافة/حذف مستخدم ---
-    if state == 'dev_await_add_id' and user_id == OWNER_ID:
+    # التحقق من الاشتراك الإجباري
+    if added_channels:
+        channel = added_channels[0]
         try:
-            target_id = int(text.strip())
-            if target_id == OWNER_ID:
-                await message.reply_text("لا يمكنك إضافة آيدي المطور.")
+            participants = await bot.get_participants(channel)
+            if user_id not in [u.id for u in participants]:
+                await event.reply(
+                    f"- يجب عليك الاشتراك في القناة التالية لاستخدام البوت:\n{channel}\n"
+                    "- بعد الاشتراك، اضغط /start مجددًا.",
+                    buttons=[[Button.url("اشترك في القناة", f"https://t.me/{channel.lstrip('@')}")]]
+                )
                 return
-            
-            # إضافة إلى DB
-            query = "INSERT OR IGNORE INTO authorized_users (user_id, added_by) VALUES (?, ?)"
-            db_execute(query, (target_id, user_id))
-            
-            await message.reply_text(f"✅ تم تفعيل المستخدم ذو الآيدي `{target_id}` بنجاح.")
-            # محاولة إرسال رسالة للمستخدم المُضاف
-            try:
-                await client.send_message(target_id, "✅ تم تفعيل حسابك من قبل المطور! يمكنك الآن استخدام البوت عبر الأمر /start")
-            except Exception:
-                await message.reply_text("⚠️ فشل إرسال رسالة تفعيل للمستخدم (قد يكون حظر البوت).")
-                pass
-                
-        except ValueError:
-            await message.reply_text("❌ يرجى إرسال رقم الآيدي بشكل صحيح.")
-        
-        USER_STATE.pop(user_id, None)
+        except ChatAdminRequiredError:
+            pass # تجاهل الخطأ للمطور لتجنب توقف البوت
+        except Exception as e:
+            print(f"Error checking channel: {e}")
+
+    await event.reply(
+        "- مرحبًا بك! يمكنك التحكم في حسابك باستخدام الخيارات التالية:",
+        buttons=home_markup
+    )
+
+@bot.on(events.CallbackQuery(data=b"home"))
+async def back_to_home(event):
+    await event.edit(
+        "- مرحبًا بك! يمكنك التحكم في حسابك باستخدام الخيارات التالية:",
+        buttons=home_markup
+    )
+
+@bot.on(events.CallbackQuery(data=b"acc_mun"))
+async def acc_mun(event):
+    buttons = [
+        [Button.inline("اضف حساب", b"register"), Button.inline("حذف حساب", b"delete_account")],
+        [Button.inline("عرض الحسابات", b"view_account")],
+        [Button.inline("العودة", b"home")]
+    ]
+    await event.edit("-قائمة الحسابات :", buttons=buttons)
+    
+@bot.on(events.CallbackQuery(data=b"manage_vip"))
+async def manage_vip(event):
+    user_id = event.sender_id
+    if user_id != owner_id:
+        await event.answer("- هذه الميزة متاحة للمالك فقط.", alert=True)
+        return
+    buttons = [
+        [Button.inline("إضافة مستخدم VIP", b"add_vip"), Button.inline("حذف مستخدم VIP", b"remove_vip")],
+        [Button.inline("عرض المستخدمين VIP", b"list_vip")],
+        [Button.inline("- إضافة قناة الاشتراك -", b"add_subscription_channel"), Button.inline("- عرض الإحصائيات -", b"stats")],
+        [Button.inline("العودة", b"home")]
+    ]
+    await event.edit("-تحكم المطور :", buttons=buttons)
+
+@bot.on(events.CallbackQuery(data=b"add_vip"))
+async def add_vip(event):
+    user_id = event.sender_id
+    if user_id != owner_id:
         return
 
-    elif state == 'dev_await_del_id' and user_id == OWNER_ID:
+    async with bot.conversation(owner_id) as conv:
+        await conv.send_message("- أرسل معرف المستخدم الذي تريد إضافته كمستخدم VIP:")
+        vip_id = (await conv.get_response(timeout=None)).text.strip()
+
         try:
-            target_id = int(text.strip())
-            
-            # حذف من المستخدمين المصرح لهم
-            db_execute("DELETE FROM authorized_users WHERE user_id = ?", (target_id,))
-            # حذف بيانات الجلسة الخاصة به أيضاً
-            db_execute("DELETE FROM sessions WHERE user_id = ?", (target_id,))
-            
-            await message.reply_text(f"✅ تم حذف المستخدم `{target_id}` وإلغاء صلاحيته وحذف بيانات جلسته بالكامل.")
+            vip_id = int(vip_id)
+            if vip_id in vip_users:
+                await conv.send_message("- المستخدم موجود بالفعل كمستخدم VIP.")
+            else:
+                vip_users.append(vip_id)
+                await save_global_settings() # حفظ التغيير في القاعدة
+                await conv.send_message(f"- تم إضافة المستخدم {vip_id} كمستخدم VIP.")
         except ValueError:
-            await message.reply_text("❌ يرجى إرسال رقم الآيدي بشكل صحيح.")
-            
-        USER_STATE.pop(user_id, None)
+            await conv.send_message("- يرجى إدخال معرف مستخدم صالح (رقم فقط).")
+
+@bot.on(events.CallbackQuery(data=b"remove_vip"))
+async def remove_vip(event):
+    user_id = event.sender_id
+    if user_id != owner_id:
         return
 
-    # --- معالجة تسجيل الدخول (الهاتف، الكود، 2FA) ---
-    if state == 'await_phone':
-        # ... (نفس منطق معالجة رقم الهاتف السابق)
-        pass # الكود هنا طويل وتم تبسيطه للاختصار، لكنه موجود كاملاً في الخلفية
+    async with bot.conversation(owner_id) as conv:
+        await conv.send_message("- أرسل معرف المستخدم الذي تريد حذفه من قائمة VIP:")
+        vip_id = (await conv.get_response(timeout=None)).text.strip()
 
-    elif isinstance(state, dict) and state.get('step') == 'await_code':
-        # ... (نفس منطق معالجة رمز التحقق السابق)
-        pass
-
-    elif state == 'await_2fa':
-        # ... (نفس منطق معالجة كلمة المرور السابق)
-        pass
-
-    # --- معالجة إضافة السوبرات ---
-    elif state == 'await_supers':
-        super_list = [s.strip() for s in text.split('\n') if s.strip()]
-        super_json = json.dumps(super_list)
-        update_session_data(user_id, super_groups=super_json)
-        
-        await message.reply_text(
-            f"✅ تم حفظ **{len(super_list)}** سوبر/قناة للنشر التلقائي. عد إلى القائمة الرئيسية.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]])
-        )
-        USER_STATE.pop(user_id, None)
-
-    # --- معالجة ضبط التأخير ---
-    elif state == 'await_delay':
         try:
-            delay = int(text.strip())
-            if delay < 1:
-                raise ValueError
-                
-            update_session_data(user_id, delay_minutes=delay)
-            
-            await message.reply_text(
-                f"✅ تم ضبط وقت التأخير بين كل رسالة على **{delay}** دقيقة. عد إلى القائمة الرئيسية.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]])
-            )
-            
+            vip_id = int(vip_id)
+            if vip_id in vip_users:
+                vip_users.remove(vip_id)
+                await save_global_settings() # حفظ التغيير في القاعدة
+                await conv.send_message(f"- تم حذف المستخدم {vip_id} من قائمة VIP.")
+            else:
+                await conv.send_message("- المستخدم غير موجود في قائمة VIP.")
         except ValueError:
-            await message.reply_text("❌ يجب أن ترسل رقماً صحيحاً يمثل الدقائق (1 فما فوق). أعد المحاولة.")
+            await conv.send_message("- يرجى إدخال معرف مستخدم صالح (رقم فقط).")
+
+@bot.on(events.CallbackQuery(data=b"manage_super"))
+async def manage_super(event):
+    await event.edit(
+        "- إدارة السوبرات:",
+        buttons=[
+            [Button.inline("إضافة سوبر", b"newSuper"), Button.inline("عرض السوبرات", b"currentSupers")],
+            [Button.inline("حذف سوبر", b"deleteSpecificSuper"), Button.inline("حذف جميع السوبرات", b"deleteAllSupers")], 
+            [Button.inline("العودة", b"home")]
+        ]
+    )
+
+@bot.on(events.CallbackQuery(data=b"newSuper"))
+async def new_super(event):
+    user_id = event.sender_id
+    await event.delete()
+
+    async with bot.conversation(user_id) as conv:
+        await conv.send_message("- أرسل رابط السوبر لإضافته:")
+        super_group_link = (await conv.get_response(timeout=None)).text.strip()
+
+        if not super_group_link:
+            await conv.send_message("- يرجى إرسال رابط صالح للقروب.")
             return
 
-        USER_STATE.pop(user_id, None)
+        if super_group_link.startswith("https://t.me/+"):
+            if not is_vip(user_id):
+                await bot.send_message(user_id, "- عذرًا، لا يمكنك إضافة رابط خاص لأنك لست VIP.")
+                return
 
-    # --- معالجة تحميل ملف التخزين ---
-    elif state == 'await_storage_file':
-        if message.document:
+        if "groups" in users[str(user_id)] and super_group_link in users[str(user_id)]["groups"]:
+            await conv.send_message("- الرابط تم إضافته بالفعل.")
+            return
+            
+        sessions = users[str(user_id)].get("sessions", [])
+        if not sessions:
+            await bot.send_message(user_id, "- لا توجد جلسات مسجلة لإضافة السوبر.")
+            return
+            
+        valid_session_found = False
+        for session_data in sessions:
+            session_string = session_data.get("session")
+            if not session_string:
+                continue
+            client = TelegramClient(StringSession(session_string), api_id, api_hash)
             try:
-                # الكود لمعالجة تحميل الملف واستخراج الجلسة والإعدادات
-                file_path = await message.download(file_name=f"upload_{user_id}.txt")
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    
-                session_match = content.split("SESSION_STRING:")[1].split("SETTINGS:")[0].strip()
-                settings_json = content.split("SETTINGS:")[1].strip()
-                settings = json.loads(settings_json)
-                
-                query = """
-                    INSERT OR REPLACE INTO sessions (user_id, session_name, session_string, cliche_text, cliche_file_id, super_groups, delay_minutes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """
-                db_execute(query, (
-                    user_id, 
-                    f"session_{user_id}", 
-                    session_match, 
-                    settings.get("cliche"), 
-                    settings.get("file_id"), 
-                    settings.get("supers"), 
-                    settings.get("delay")
-                ))
-                
-                await message.reply_text("✅ تم تحميل الجلسة والإعدادات بنجاح! يمكنك الآن بدء النشر.")
-                
+                await client.connect()
+                if not await client.is_user_authorized():
+                    raise Exception("الجلسة غير صالحة")
+                try:
+                    await client(JoinChannelRequest(super_group_link))
+                    try:
+                        entity = await client.get_entity(super_group_link)
+                        if isinstance(entity, Channel) and entity.megagroup:
+                            if "groups" not in users[str(user_id)]:
+                                users[str(user_id)]["groups"] = []
+                            users[str(user_id)]["groups"].append(super_group_link)
+                            await save_user(user_id) # حفظ
+                            await bot.send_message(user_id, f"- تم إضافة السوبر بنجاح: {super_group_link}")
+                        else:
+                            await bot.send_message(user_id, "- الرابط لا يشير إلى مجموعة.")
+                    except Exception as e:
+                        await bot.send_message(user_id, f"- حدث خطأ أثناء الحصول على معلومات المجموعة: {str(e)}")
+                    valid_session_found = True
+                    break
+                except ChannelPrivateError:
+                    await bot.send_message(user_id, "- المجموعة خاصة ولا يمكن الانضمام إليها بدون دعوة.")
+                except UserBannedInChannelError:
+                    await bot.send_message(user_id, "- تم حظر الحساب من الانضمام إلى هذه المجموعة.")
+                except Exception as e:
+                    await bot.send_message(user_id, f"- حدث خطأ أثناء محاولة الانضمام: {str(e)}")
             except Exception as e:
-                await message.reply_text(f"❌ خطأ في تحليل ملف التخزين. تأكد من إرسال الملف الأصلي: {e}")
-                
+                # حذف الجلسة التالفة
+                users[str(user_id)]["sessions"] = [s for s in users[str(user_id)]["sessions"] if s["session"] != session_string]
+                await save_user(user_id)
             finally:
-                os.remove(file_path)
-        else:
-            await message.reply_text("❌ يرجى إرسال ملف التخزين بصيغة ملف `txt`.")
+                await client.disconnect()
+        if not valid_session_found:
+            await bot.send_message(user_id, "حدث خطأ حاول الانضمام للرابط بشكل يدوي وارجع اضفه")
 
-        USER_STATE.pop(user_id, None)
+@bot.on(events.CallbackQuery(data=b"currentSupers"))
+async def current_supers(event):
+    user_id = event.sender_id
+    groups = users[str(user_id)].get("groups", [])
+    if not groups:
+        await event.answer("- لا توجد سوبرات مضافة.", alert=True)
+    else:
+        buttons = []
+        for group in groups:
+            # تقصير اسم الزر إذا كان طويلاً جداً
+            display_text = group if len(group) < 30 else group[:27] + "..."
+            buttons.append([Button.inline(display_text, f"delSuper:{groups.index(group)}")])
+        buttons.append([Button.inline("العودة", b"home")])
+        await event.edit("- السوبرات المضافة:", buttons=buttons)
 
-    # --- معالجة الكليشة النصية (إذا كانت فقط نص) ---
-    elif state == 'await_cliche' and message.text and not message.media:
-        update_session_data(user_id, cliche_text=message.text, cliche_file_id=None)
-        
-        await message.reply_text(
-            f"✅ تم حفظ الكليشة (نص). عد إلى القائمة الرئيسية.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]])
+@bot.on(events.CallbackQuery(data=b"deleteAllSupers"))
+async def delete_all_supers(event):
+    user_id = event.sender_id
+    if "groups" in users[str(user_id)] and users[str(user_id)]["groups"]:
+        users[str(user_id)]["groups"] = []
+        await save_user(user_id) # حفظ
+        await bot.send_message(user_id, "- تم حذف جميع السوبرات بنجاح.")
+    else:
+        await bot.send_message(user_id, "- لا توجد سوبرات لحذفها.")
+
+@bot.on(events.CallbackQuery(data=b"add_subscription_channel"))
+async def add_subscription_channel(event):
+    user_id = event.sender_id
+    if user_id != owner_id:
+        await event.answer("- هذه الميزة متاحة للمالك فقط.", alert=True)
+        return
+    
+    global added_channels 
+    added_channels = [] # إعادة تعيين القائمة
+    async with bot.conversation(owner_id) as conv:
+        await conv.send_message("- أرسل معرف القناة التي تريد إضافتها كقناة اشتراك (مثل: @M_D_I):")
+        channel_username = (await conv.get_response(timeout=None)).text.strip()
+        added_channels.append(channel_username)
+        await save_global_settings() # حفظ
+        await conv.send_message(f"- تم تعيين القناة التالية كقناة اشتراك إجباري: {channel_username}")
+
+@bot.on(events.CallbackQuery(data=b"list_vip"))
+async def list_vip(event):
+    user_id = event.sender_id
+    if user_id != owner_id:
+        await event.answer("- هذه الميزة متاحة للمالك فقط.", alert=True)
+        return
+
+    if not vip_users:
+        await event.edit("- لا يوجد مستخدمون VIP حاليًا.", buttons=[[Button.inline("العودة", b"manage_vip")]])
+    else:
+        vip_list = "\n".join([f"- {vip_id}" for vip_id in vip_users])
+        await event.edit(
+            f"- قائمة المستخدمين VIP:\n\n{vip_list}",
+            buttons=[[Button.inline("العودة", b"manage_vip")]]
         )
-        USER_STATE.pop(user_id, None)
 
-# --- 7. معالجة الكليشة (الملتيميديا) ---
-
-@app.on_message(filters.private & filters.media & filters.incoming)
-async def cliche_media_processor(client: Client, message: Message):
-    user_id = message.from_user.id
-    state = USER_STATE.get(user_id)
+@bot.on(events.CallbackQuery(data=b"register"))
+async def register_account(event):
+    user_id = event.sender_id
+    await event.delete()
     
-    # 🛑 فحص التحكم بالوصول 🛑
-    if user_id != OWNER_ID and not is_user_authorized(user_id):
-        return
-    
-    if state == 'await_cliche':
-        file_id = None
-        caption = message.caption or ""
+    if str(user_id) not in users:
+        # إنشاء هيكل المستخدم إذا لم يكن موجوداً
+        users[str(user_id)] = {"_id": user_id, "sessions": [], "groups": [], "posting": False}
         
-        if message.photo:
-            file_id = message.photo.file_id
-        elif message.video:
-            file_id = message.video.file_id
-        elif message.document:
-            file_id = message.document.file_id
-
-        if file_id:
-            # تحديث DB
-            update_session_data(user_id, cliche_text=caption, cliche_file_id=file_id)
+    if user_id == owner_id or user_id in vip_users:
+        max_accounts = 10
+    else:
+        max_accounts = 1
+        
+    if len(users[str(user_id)]["sessions"]) >= max_accounts:
+        if user_id not in vip_users:
+            await bot.send_message(user_id, "- عذرًا، لا يمكنك إضافة أكثر من حساب واحد لأنك لست VIP.")
+            return
+        else:
+            await bot.send_message(user_id, f"- لقد وصلت إلى الحد الأقصى من الحسابات ({max_accounts}).")
+            return
             
-            await message.reply_text(
-                f"✅ تم حفظ الكليشة (ملف). النص المرفق: `{caption or 'لا يوجد نص'}`. عد إلى القائمة الرئيسية.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]])
-            )
-            USER_STATE.pop(user_id, None)
-            
-# --- 8. وحدة النشر التلقائي (الـ Scheduler) ---
-
-# هذه الوظائف تحتاج إلى استكمال منطق تسجيل الدخول كاملاً (phone, code, 2fa) لكي تعمل الجلسات بشكل سليم.
-
-async def post_job(user_client: Client, user_id, cliche_text, cliche_file_id, super_groups, delay):
-    """وظيفة النشر الفعلية لمستخدم واحد."""
-    
-    try:
-        super_list = json.loads(super_groups)
-    except:
-        return
-
-    for chat_id in super_list:
+    async with bot.conversation(user_id) as conv:
+        await conv.send_message("- أرسل كود الجلسة الخاص بك:")
         try:
-            if cliche_file_id:
-                # يتم استخدام send_cached_media إذا كان الكليشة ملف (صورة، فيديو)
-                await user_client.send_cached_media(chat_id, cliche_file_id, caption=cliche_text)
-            else:
-                await user_client.send_message(chat_id, cliche_text)
-            
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-        except Exception as e:
-            print(f"فشل النشر في {chat_id} للمستخدم {user_id}: {e}")
+            response = await conv.get_response(timeout=60)
+            session_string = response.text.strip()
+            client = TelegramClient(StringSession(session_string), api_id, api_hash)
+            try:
+                await client.connect()
+                if not await client.is_user_authorized():
+                    raise Exception("Auth Error")
+                me = await client.get_me()
+                full_name = f"{me.first_name} {me.last_name}" if me.last_name else me.first_name
+                await conv.send_message(f"- تم تسجيل الدخول باستخدام الجلسة بنجاح! مرحبًا {full_name} .")
+                
+                users[str(user_id)]["sessions"].append({
+                    "session": session_string, 
+                    "username": me.username, 
+                    "id": me.id
+                })
+                await save_user(user_id) # حفظ
+            except Exception as e:
+                await conv.send_message(f"- الجلسة غير صالحة استخرج واحده جديدة وحاول مجدداً")
+                return
+            finally:
+                await client.disconnect()
+        except asyncio.TimeoutError:
+            await conv.send_message("- لم يتم الرد في الوقت المحدد. تم إلغاء العملية.")
 
-async def posting_scheduler():
-    """الحلقة الرئيسية لجدولة المهام."""
-    # ملاحظة: تم تبسيط الجدولة هنا لاستخدام `asyncio.sleep` كبديل لمكتبة `APScheduler`
-    # للحصول على أداء أفضل في الإنتاج، يفضل استخدام مكتبة جدولة متقدمة.
-    while True:
-        await asyncio.sleep(60) # فحص كل دقيقة
+@bot.on(events.CallbackQuery(data=b"view_account"))
+async def view_account(event):
+    user_id = event.sender_id
+    sessions = users[str(user_id)].get("sessions", [])    
+    if not sessions:
+        await event.edit(
+            "- لا توجد حسابات مسجلة حاليًا. قم بتسجيل حساب جديد.",
+            buttons=[[Button.inline("تسجيل حساب", b"register")]]
+        )
+        return
         
-        query = "SELECT user_id, session_string, cliche_text, cliche_file_id, super_groups, delay_minutes FROM sessions WHERE is_running = 1"
-        active_sessions = db_execute(query, fetchall=True)
+    accounts_info = []
+    valid_sessions = []
+    has_changes = False
+    
+    for i, session_data in enumerate(sessions):
+        session_string = session_data["session"]
+        try:
+            client = TelegramClient(StringSession(session_string), api_id, api_hash)
+            await client.connect()
+            if not await client.is_user_authorized():
+                raise Exception("Auth Error")
+            me = await client.get_me()
+            full_name = f"{me.first_name} {me.last_name}" if me.last_name else me.first_name
+            phone = getattr(me, 'phone', 'Unknown')
+            accounts_info.append(
+                f"**الحساب {i+1}:**\n"
+                f"- **الاسم الكامل**: {full_name}\n"
+                f"- **ID**: {me.id}\n"
+                f"- **الرقم المرتبط**: {phone}"
+            )
+            valid_sessions.append(session_data)
+        except Exception as e:
+            accounts_info.append(f"**الحساب {i+1}:**\n- الجلسة غير صالحة وتم حذفها")
+            has_changes = True
+        finally:
+            await client.disconnect()
+            
+    if has_changes:
+        users[str(user_id)]["sessions"] = valid_sessions
+        await save_user(user_id) # حفظ التعديلات
+
+    accounts_info_text = "\n\n".join(accounts_info)
+    await event.edit(
+        f"- الحسابات الحالية:\n\n{accounts_info_text}",
+        buttons=[[Button.inline("العودة", b"home")]]
+    )
+
+@bot.on(events.CallbackQuery(data=b"posting_settings"))
+async def posting_settings(event):
+    await event.edit(
+        "- إعدادات النشر:",
+        buttons=[
+            [Button.inline("تعيين الكليشة", b"newCaption"), Button.inline("الكليشة الثانية", b"newCaption2")],
+            [Button.inline("الكليشة الثالثة", b"newCaption3"), Button.inline("الكليشة الرابعة", b"newCaption4")],
+            [Button.inline("حذف الكلايش", b"deleteAllCaptions")],
+            [Button.inline("بدء النشر", b"startPosting"), Button.inline("إيقاف النشر", b"stopPosting")],
+            [Button.inline("تعيين وقت الانتظار", b"waitTime")],
+            [Button.inline("العودة", b"home")]
+        ]
+    )
+
+@bot.on(events.CallbackQuery(data=b"deleteAllCaptions"))
+async def delete_all_captions(event):
+    user_id = event.sender_id
+    users[str(user_id)]["caption_1"] = ""
+    users[str(user_id)]["caption_2"] = ""
+    users[str(user_id)]["caption_3"] = ""
+    users[str(user_id)]["caption_4"] = ""
+    await save_user(user_id)
+    await bot.send_message(user_id, "- تم مسح جميع الكلايش بنجاح!")
+
+@bot.on(events.CallbackQuery(data=b"newCaption"))
+async def new_caption(event):
+    user_id = event.sender_id
+    await event.delete()
+    async with bot.conversation(user_id) as conv:
+        await conv.send_message("- أرسل الكليشة الجديدة:") 
+        caption_1 = (await conv.get_response(timeout=None)).text 
+        users[str(user_id)]["caption_1"] = caption_1
+        await save_user(user_id)
+        await bot.send_message(user_id, f"- تم تحديث الكليشة بنجاح! الكليشة الجديدة هي: {caption_1}")
         
-        if not active_sessions:
-            continue
-            
-        for user_id, session_string, cliche_text, cliche_file_id, super_groups, delay_minutes in active_sessions:
-            
-            # حساب وقت الانتظار الفعلي بناءً على الدقائق
-            # إذا كان delay_minutes = 5، سيعمل كل 5 دقائق
+@bot.on(events.CallbackQuery(data=b"newCaption2"))
+async def new_caption2(event):
+    user_id = event.sender_id
+    if not is_vip(user_id):
+        await bot.send_message(user_id, "- عذرًا، لا يمكنك تحديد أكثر من كليشة لأنك لست VIP.")
+        return
+    await event.delete()
+    async with bot.conversation(user_id) as conv:
+        await conv.send_message("- أرسل الكليشة الثانية الجديدة:")
+        caption_2 = (await conv.get_response(timeout=None)).text 
+        users[str(user_id)]["caption_2"] = caption_2 
+        await save_user(user_id)
+        await bot.send_message(user_id, f"- تم تحديث الكليشة الثانية بنجاح! الكليشة الثانية الجديدة هي: {caption_2}")
+
+@bot.on(events.CallbackQuery(data=b"newCaption3"))
+async def new_caption3(event):
+    user_id = event.sender_id
+    if not is_vip(user_id):
+        await bot.send_message(user_id, "- عذرًا، لا يمكنك تحديد أكثر من كليشة لأنك لست VIP.")
+        return
+    await event.delete()
+    async with bot.conversation(user_id) as conv:
+        await conv.send_message("- أرسل الكليشة الثالثة الجديدة:")
+        caption_3 = (await conv.get_response(timeout=None)).text 
+        users[str(user_id)]["caption_3"] = caption_3 
+        await save_user(user_id)
+        await bot.send_message(user_id, f"- تم تحديث الكليشة الثالثة بنجاح! الكليشة الثالثة الجديدة هي: {caption_3}")
+
+@bot.on(events.CallbackQuery(data=b"newCaption4"))
+async def new_caption4(event):
+    user_id = event.sender_id
+    if not is_vip(user_id):
+        await bot.send_message(user_id, "- عذرًا، لا يمكنك تحديد أكثر من كليشة لأنك لست VIP.")
+        return
+    await event.delete()
+    async with bot.conversation(user_id) as conv:
+        await conv.send_message("- أرسل الكليشة الرابعة الجديدة:")
+        caption_4 = (await conv.get_response(timeout=None)).text 
+        users[str(user_id)]["caption_4"] = caption_4
+        await save_user(user_id)
+        await bot.send_message(user_id, f"- تم تحديث الكليشة الرابعة بنجاح! الكليشة الرابعة الجديدة هي: {caption_4}")
+
+@bot.on(events.CallbackQuery(data=b"waitTime"))
+async def wait_time(event):
+    user_id = event.sender_id
+    await event.delete()
+    async with bot.conversation(user_id) as conv:
+        await conv.send_message("- أرسل مدة الانتظار (بالثواني):")
+        wait_txt = (await conv.get_response(timeout=None)).text
+        try:
+            wait_val = int(wait_txt)
+            if wait_val <= 59:
+                raise ValueError("القيمة يجب أن تكون أكبر من دقيقة.")
+            users[str(user_id)]["waitTime"] = wait_val
+            await save_user(user_id)
+            await bot.send_message(user_id, f"- تم تعيين وقت الانتظار بنجاح: {wait_val} ثواني")
+        except ValueError as e:
+            await bot.send_message(user_id, f"القيمة يجب أن تكون أكبر من دقيقة.")
+
+@bot.on(events.CallbackQuery(data=b"startPosting"))
+async def start_posting(event):
+    user_id = event.sender_id
+    
+    if str(user_id) not in users:
+        await event.answer("- المستخدم غير موجود!", alert=True)
+        return
+        
+    users[str(user_id)]["posting"] = True
+    await save_user(user_id)
+    await event.answer("- تم بدء النشر التلقائي لجميع الحسابات!")
+    
+    if not users[str(user_id)].get("sessions"):
+        await event.answer("- لا توجد حسابات مضافة للنشر فيها.", alert=True)
+        users[str(user_id)]["posting"] = False
+        await save_user(user_id)
+        return
+    
+    groups = users[str(user_id)].get("groups", [])
+    if not groups:
+        await event.answer("- لا توجد سوبرات مضافة للنشر فيها.", alert=True)
+        users[str(user_id)]["posting"] = False
+        await save_user(user_id)
+        return
+        
+    captions = [
+        users[str(user_id)].get("caption_1", ""),
+        users[str(user_id)].get("caption_2", ""),
+        users[str(user_id)].get("caption_3", ""),
+        users[str(user_id)].get("caption_4", "")
+    ]
+    captions = [caption for caption in captions if caption]
+    
+    if not captions:
+        await event.answer("- لا توجد كليشة لنشرها.", alert=True)
+        return
+
+    wait_time_val = users[str(user_id)].get("waitTime", 60)
+    
+    async def post_in_group(session_string, group):
+        client = TelegramClient(StringSession(session_string), api_id, api_hash)
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                raise Exception("Auth Error")
             
             try:
-                user_client = Client(
-                    f"temp_poster_{user_id}",
-                    api_id=API_ID,
-                    api_hash=API_HASH,
-                    session_string=session_string,
-                    in_memory=True
-                )
-                await user_client.start()
+                await client.send_message("me", "✅ تم تشغيل الجلسة بنجاح.")
+            except: pass
+            
+            while users[str(user_id)]["posting"]:
+                for caption in captions:
+                    if not users[str(user_id)]["posting"]: break 
+                    try:
+                        if group.startswith("https://t.me/"):
+                            try:
+                                await client(JoinChannelRequest(group))
+                                await client.send_message(group, caption)
+                            except ChannelPrivateError:
+                                if group in users[str(user_id)]["groups"]:
+                                    users[str(user_id)]["groups"].remove(group)
+                                    await save_user(user_id)
+                                continue
+                            except UserBannedInChannelError:
+                                if group in users[str(user_id)]["groups"]:
+                                    users[str(user_id)]["groups"].remove(group)
+                                    await save_user(user_id)
+                                continue
+                        else:
+                            await client.send_message(group, caption)
+                    except FloodWaitError as e:
+                        await asyncio.sleep(e.seconds)
+                    except Exception as e:
+                        print(f"Error posting in {group}: {e}")
                 
-                asyncio.create_task(
-                    post_job(user_client, user_id, cliche_text, cliche_file_id, super_groups, delay_minutes)
-                )
-                
-                # الانتظار المدة المطلوبة قبل النشر التالي لنفس المستخدم
-                await asyncio.sleep(delay_minutes * 60)
+                await asyncio.sleep(wait_time_val)
+        except Exception as e:
+            # حذف الجلسة إذا كانت تالفة
+            print(f"Session Error: {e}")
+            current_sessions = users[str(user_id)]["sessions"]
+            new_sessions = [s for s in current_sessions if s["session"] != session_string]
+            if len(current_sessions) != len(new_sessions):
+                users[str(user_id)]["sessions"] = new_sessions
+                await save_user(user_id)
+        finally:
+            await client.disconnect()
 
-                await user_client.stop()
-                
-            except Exception as e:
-                # إيقاف النشر إذا كانت الجلسة تالفة
-                update_session_data(user_id, is_running=0)
+    tasks = []
+    for session_data in users[str(user_id)]["sessions"]:
+        session_string = session_data["session"]
+        for group in groups:
+            tasks.append(post_in_group(session_string, group))
+    
+    # تشغيل المهام في الخلفية
+    asyncio.create_task(asyncio.gather(*tasks))
 
+@bot.on(events.CallbackQuery(data=b"stopPosting"))
+async def stop_posting(event):
+    user_id = event.sender_id
+    users[str(user_id)]["posting"] = False
+    await save_user(user_id) 
+    await event.answer("- تم إيقاف النشر التلقائي!")
+    
+@bot.on(events.CallbackQuery(data=b"stats"))
+async def stats(event):
+    if event.sender_id == owner_id:
+        total_users = len(users)
+        total_groups = sum(len(user.get("groups", [])) for user in users.values())
+        total_accounts = sum(len(user.get("sessions", [])) for user in users.values())
 
-# --- 9. تشغيل البوت ---
+        await event.edit(
+            f"- عدد المستخدمين: {total_users}\n"
+            f"- عدد السوبرات: {total_groups}\n"
+            f"- عدد الحسابات المسجلة: {total_accounts}",
+            buttons=[[Button.inline("العودة", b"home")]]
+        )
+    else:
+        await event.answer("- هذه الميزة متاحة للمالك فقط.", alert=True)
 
-async def main():
-    init_db()
-    
-    # ⚠️ ملاحظة: يجب إكمال منطق تسجيل الدخول (الهاتف، الكود، 2FA) 
-    # في دالة state_processor لضمان عمل إضافة الجلسة بشكل سليم
-    
-    asyncio.create_task(posting_scheduler())
-    
-    print("البوت يعمل...")
-    await app.start()
-    await idle()
-    
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("تم إيقاف البوت.")
+# نقطة الدخول الرئيسية (Entry Point)
+if __name__ == '__main__':
+    bot.loop.run_until_complete(load_data_from_db())
+    print("Bot is running with MongoDB...")
+    bot.run_until_disconnected()
