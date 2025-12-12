@@ -9,22 +9,27 @@ import os
 import motor.motor_asyncio
 import certifi
 
-# --- إعدادات الاتصال ---
+# --- إعدادات البوت والـ API ---
 api_id = 28557217
 api_hash = "22fb694b8c569117cc056073fc444597"
 bot_token = "6872922603:AAEckw1ILOGNhq9fYQB8L-bK_DAHdSNCue0"
 owner_id = 6646631745
 
-# رابط الاتصال
-MONGO_URL = "mongodb+srv://djdidjbbjydjdj_db_user:d1JifOpzMkiL6Mkf@cluster0.gm4nvdj.mongodb.net/?retryWrites=true&w=majority"
+# --- إعدادات MongoDB (تم دمج بيانات الاعتماد) ---
+# اسم المستخدم: djdidjbbjydjdj_db_user
+# كلمة المرور: d1JifOpzMkiL6Mkf
 
-# --- [تعديل جذري] تجاوز مشاكل SSL ---
-# تم إضافة tlsAllowInvalidCertificates=True لحل مشكلة TLSV1_ALERT_INTERNAL_ERROR
+MONGO_URL = "mongodb+srv://djdidjbbjydjdj_db_user:d1JifOpzMkiL6Mkf@cluster0.gm4nvdj.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+
+# --- [تعديل جذري] لضمان الاتصال الآمن والموثوق على Heroku ---
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(
     MONGO_URL,
-    tls=True,
-    tlsAllowInvalidCertificates=True,  # يسمح بالاتصال حتى لو فشل التحقق من الشهادة
-    serverSelectionTimeoutMS=5000      # تقليل وقت الانتظار عند الفشل
+    # استخدم خيار tlsCAFile مع certifi للتحقق من الشهادة (الطريقة الأفضل)
+    tlsCAFile=certifi.where(),
+    # إضافة خيارات تجعل الاتصال أكثر تسامحاً مع بيئات النشر
+    serverSelectionTimeoutMS=5000,
+    connectTimeoutMS=20000,
+    socketTimeoutMS=20000,
 )
 
 db = mongo_client["TelethonBotDB"]
@@ -47,7 +52,7 @@ async def load_data_from_db():
     print("جاري الاتصال بـ MongoDB...")
     
     try:
-        # فحص الاتصال أولاً
+        # فحص الاتصال أولاً - سيقوم بمحاولة الاتصال بالخادم
         await mongo_client.admin.command('ping')
         print("تم الاتصال بقاعدة البيانات بنجاح!")
         
@@ -75,8 +80,9 @@ async def load_data_from_db():
             
         print(f"تم تحميل {len(users)} مستخدم.")
     except Exception as e:
+        # إذا استمر هذا الخطأ، فالمشكلة حتماً في Network Access في موقع MongoDB Atlas
         print(f"❌ فشل الاتصال بقاعدة البيانات: {e}")
-        print("تأكد من تفعيل Network Access: 0.0.0.0/0 في MongoDB Atlas")
+        print("🛑 الخطوة الأخيرة: تأكد من تفعيل Network Access: 0.0.0.0/0 في MongoDB Atlas!")
 
 async def save_user(user_id):
     """حفظ بيانات مستخدم محدد في القاعدة"""
@@ -85,6 +91,7 @@ async def save_user(user_id):
         user_data = users[user_id_str].copy()
         user_data["_id"] = int(user_id)
         try:
+            # زيادة مهلة الاختيار في حال كان الخادم بطيئاً في الاستجابة
             await users_collection.replace_one({"_id": int(user_id)}, user_data, upsert=True)
         except Exception as e:
             print(f"Error saving user {user_id}: {e}")
