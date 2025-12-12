@@ -1,2 +1,6 @@
 pyrogram
 tgcrypto
+telethon
+tgcrypto
+motor
+python-dotenv
