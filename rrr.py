@@ -6,28 +6,30 @@ from telethon.errors import PhoneCodeInvalidError, PhoneNumberInvalidError, Sess
 from telethon.sessions import StringSession
 from datetime import datetime
 import os
-import motor.motor_asyncio # مكتبة المونجو دي بي
+import motor.motor_asyncio
+import certifi #  ضروري لحل مشكلة SSL
 
 # --- إعدادات الاتصال ---
 api_id = 28557217
 api_hash = "22fb694b8c569117cc056073fc444597"
-bot_token = "6872922603:AAEckw1ILOGNhq9fYQB8L-bK_DAHdSNCue0"
+bot_token = "7239771660:AAEmxmo5l8TN1QsRccCtnb_FS6EP_2HfsV4"
 owner_id = 6646631745
 
-# رابط الاتصال بقاعدة البيانات (تم إزالة المسافة المتوقعة في كلمة المرور لضمان الاتصال)
-# اذا كانت كلمة المرور تحتوي مسافة بالفعل، اعدها كما كانت
+# رابط الاتصال (تم تصحيحه)
 MONGO_URL = "mongodb+srv://djdidjbbjydjdj_db_user:d1JifOpzMkiL6Mkf@cluster0.gm4nvdj.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 
-# تهيئة عميل المونجو
-mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URL)
-db = mongo_client["TelethonBotDB"] # اسم قاعدة البيانات
+# --- [تعديل هام] إضافة certifi للاتصال الآمن ---
+mongo_client = motor.motor_asyncio.AsyncIOMotorClient(
+    MONGO_URL,
+    tlsCAFile=certifi.where()  # هذا السطر يحل مشكلة SSL handshake failed
+)
+db = mongo_client["TelethonBotDB"]
 users_collection = db["users"]
 settings_collection = db["settings"]
 
 bot = TelegramClient("bot", api_id, api_hash).start(bot_token=bot_token)
 
 # --- متغيرات الذاكرة المؤقتة (Cache) ---
-# سيتم تحميل البيانات هنا عند تشغيل البوت لتقليل الضغط على القاعدة
 users = {}
 vip_users = []
 added_channels = []
@@ -40,47 +42,54 @@ async def load_data_from_db():
     
     print("جاري تحميل البيانات من MongoDB...")
     
-    # تحميل المستخدمين
-    users = {}
-    async for user in users_collection.find():
-        user_id = str(user["_id"])
-        users[user_id] = user
-        # تحويل القوائم والقيم الافتراضية إذا لم تكن موجودة
-        if "sessions" not in users[user_id]: users[user_id]["sessions"] = []
-        if "groups" not in users[user_id]: users[user_id]["groups"] = []
-    
-    # تحميل الإعدادات العامة (VIPs والقنوات)
-    settings = await settings_collection.find_one({"_id": "global_settings"})
-    if settings:
-        vip_users = settings.get("vip_users", [])
-        added_channels = settings.get("added_channels", [])
-    else:
-        # إنشاء مستند الإعدادات إذا لم يكن موجوداً
-        await settings_collection.insert_one({
-            "_id": "global_settings",
-            "vip_users": [],
-            "added_channels": []
-        })
-        vip_users = []
-        added_channels = []
+    try:
+        # تحميل المستخدمين
+        users = {}
+        async for user in users_collection.find():
+            user_id = str(user["_id"])
+            users[user_id] = user
+            if "sessions" not in users[user_id]: users[user_id]["sessions"] = []
+            if "groups" not in users[user_id]: users[user_id]["groups"] = []
         
-    print("تم تحميل البيانات بنجاح.")
+        # تحميل الإعدادات العامة
+        settings = await settings_collection.find_one({"_id": "global_settings"})
+        if settings:
+            vip_users = settings.get("vip_users", [])
+            added_channels = settings.get("added_channels", [])
+        else:
+            await settings_collection.insert_one({
+                "_id": "global_settings",
+                "vip_users": [],
+                "added_channels": []
+            })
+            vip_users = []
+            added_channels = []
+            
+        print("تم تحميل البيانات بنجاح.")
+    except Exception as e:
+        print(f"خطأ في الاتصال بقاعدة البيانات: {e}")
 
 async def save_user(user_id):
     """حفظ بيانات مستخدم محدد في القاعدة"""
     user_id_str = str(user_id)
     if user_id_str in users:
         user_data = users[user_id_str].copy()
-        user_data["_id"] = int(user_id) # استخدام الـ ID كمفتاح أساسي
-        await users_collection.replace_one({"_id": int(user_id)}, user_data, upsert=True)
+        user_data["_id"] = int(user_id)
+        try:
+            await users_collection.replace_one({"_id": int(user_id)}, user_data, upsert=True)
+        except Exception as e:
+            print(f"Error saving user {user_id}: {e}")
 
 async def save_global_settings():
     """حفظ إعدادات VIP والقنوات"""
-    await settings_collection.update_one(
-        {"_id": "global_settings"},
-        {"$set": {"vip_users": vip_users, "added_channels": added_channels}},
-        upsert=True
-    )
+    try:
+        await settings_collection.update_one(
+            {"_id": "global_settings"},
+            {"$set": {"vip_users": vip_users, "added_channels": added_channels}},
+            upsert=True
+        )
+    except Exception as e:
+        print(f"Error saving settings: {e}")
 
 def is_vip(user_id):
     return user_id == owner_id or user_id in vip_users
@@ -98,7 +107,6 @@ async def start(event):
     user_id = event.sender_id
     user_id_str = str(user_id)
     
-    # التحقق مما إذا كان المستخدم جديداً وإضافته
     if user_id_str not in users:
         users[user_id_str] = {
             "_id": user_id,
@@ -111,9 +119,8 @@ async def start(event):
             "caption_4": "",
             "waitTime": 60
         }
-        await save_user(user_id) # حفظ في القاعدة
+        await save_user(user_id)
 
-    # التحقق من الاشتراك الإجباري
     if added_channels:
         channel = added_channels[0]
         try:
@@ -126,7 +133,7 @@ async def start(event):
                 )
                 return
         except ChatAdminRequiredError:
-            pass # تجاهل الخطأ للمطور لتجنب توقف البوت
+            pass
         except Exception as e:
             print(f"Error checking channel: {e}")
 
@@ -168,8 +175,7 @@ async def manage_vip(event):
 @bot.on(events.CallbackQuery(data=b"add_vip"))
 async def add_vip(event):
     user_id = event.sender_id
-    if user_id != owner_id:
-        return
+    if user_id != owner_id: return
 
     async with bot.conversation(owner_id) as conv:
         await conv.send_message("- أرسل معرف المستخدم الذي تريد إضافته كمستخدم VIP:")
@@ -181,7 +187,7 @@ async def add_vip(event):
                 await conv.send_message("- المستخدم موجود بالفعل كمستخدم VIP.")
             else:
                 vip_users.append(vip_id)
-                await save_global_settings() # حفظ التغيير في القاعدة
+                await save_global_settings()
                 await conv.send_message(f"- تم إضافة المستخدم {vip_id} كمستخدم VIP.")
         except ValueError:
             await conv.send_message("- يرجى إدخال معرف مستخدم صالح (رقم فقط).")
@@ -189,8 +195,7 @@ async def add_vip(event):
 @bot.on(events.CallbackQuery(data=b"remove_vip"))
 async def remove_vip(event):
     user_id = event.sender_id
-    if user_id != owner_id:
-        return
+    if user_id != owner_id: return
 
     async with bot.conversation(owner_id) as conv:
         await conv.send_message("- أرسل معرف المستخدم الذي تريد حذفه من قائمة VIP:")
@@ -200,7 +205,7 @@ async def remove_vip(event):
             vip_id = int(vip_id)
             if vip_id in vip_users:
                 vip_users.remove(vip_id)
-                await save_global_settings() # حفظ التغيير في القاعدة
+                await save_global_settings()
                 await conv.send_message(f"- تم حذف المستخدم {vip_id} من قائمة VIP.")
             else:
                 await conv.send_message("- المستخدم غير موجود في قائمة VIP.")
@@ -230,7 +235,6 @@ async def new_super(event):
         if not super_group_link:
             await conv.send_message("- يرجى إرسال رابط صالح للقروب.")
             return
-
         if super_group_link.startswith("https://t.me/+"):
             if not is_vip(user_id):
                 await bot.send_message(user_id, "- عذرًا، لا يمكنك إضافة رابط خاص لأنك لست VIP.")
@@ -248,37 +252,22 @@ async def new_super(event):
         valid_session_found = False
         for session_data in sessions:
             session_string = session_data.get("session")
-            if not session_string:
-                continue
+            if not session_string: continue
             client = TelegramClient(StringSession(session_string), api_id, api_hash)
             try:
                 await client.connect()
-                if not await client.is_user_authorized():
-                    raise Exception("الجلسة غير صالحة")
+                if not await client.is_user_authorized(): raise Exception("Auth Error")
                 try:
                     await client(JoinChannelRequest(super_group_link))
-                    try:
-                        entity = await client.get_entity(super_group_link)
-                        if isinstance(entity, Channel) and entity.megagroup:
-                            if "groups" not in users[str(user_id)]:
-                                users[str(user_id)]["groups"] = []
-                            users[str(user_id)]["groups"].append(super_group_link)
-                            await save_user(user_id) # حفظ
-                            await bot.send_message(user_id, f"- تم إضافة السوبر بنجاح: {super_group_link}")
-                        else:
-                            await bot.send_message(user_id, "- الرابط لا يشير إلى مجموعة.")
-                    except Exception as e:
-                        await bot.send_message(user_id, f"- حدث خطأ أثناء الحصول على معلومات المجموعة: {str(e)}")
+                    if "groups" not in users[str(user_id)]: users[str(user_id)]["groups"] = []
+                    users[str(user_id)]["groups"].append(super_group_link)
+                    await save_user(user_id)
+                    await bot.send_message(user_id, f"- تم إضافة السوبر بنجاح: {super_group_link}")
                     valid_session_found = True
                     break
-                except ChannelPrivateError:
-                    await bot.send_message(user_id, "- المجموعة خاصة ولا يمكن الانضمام إليها بدون دعوة.")
-                except UserBannedInChannelError:
-                    await bot.send_message(user_id, "- تم حظر الحساب من الانضمام إلى هذه المجموعة.")
                 except Exception as e:
-                    await bot.send_message(user_id, f"- حدث خطأ أثناء محاولة الانضمام: {str(e)}")
-            except Exception as e:
-                # حذف الجلسة التالفة
+                    await bot.send_message(user_id, f"- حدث خطأ أثناء الانضمام: {str(e)}")
+            except Exception:
                 users[str(user_id)]["sessions"] = [s for s in users[str(user_id)]["sessions"] if s["session"] != session_string]
                 await save_user(user_id)
             finally:
@@ -295,7 +284,6 @@ async def current_supers(event):
     else:
         buttons = []
         for group in groups:
-            # تقصير اسم الزر إذا كان طويلاً جداً
             display_text = group if len(group) < 30 else group[:27] + "..."
             buttons.append([Button.inline(display_text, f"delSuper:{groups.index(group)}")])
         buttons.append([Button.inline("العودة", b"home")])
@@ -306,7 +294,7 @@ async def delete_all_supers(event):
     user_id = event.sender_id
     if "groups" in users[str(user_id)] and users[str(user_id)]["groups"]:
         users[str(user_id)]["groups"] = []
-        await save_user(user_id) # حفظ
+        await save_user(user_id)
         await bot.send_message(user_id, "- تم حذف جميع السوبرات بنجاح.")
     else:
         await bot.send_message(user_id, "- لا توجد سوبرات لحذفها.")
@@ -314,56 +302,37 @@ async def delete_all_supers(event):
 @bot.on(events.CallbackQuery(data=b"add_subscription_channel"))
 async def add_subscription_channel(event):
     user_id = event.sender_id
-    if user_id != owner_id:
-        await event.answer("- هذه الميزة متاحة للمالك فقط.", alert=True)
-        return
+    if user_id != owner_id: return
     
     global added_channels 
-    added_channels = [] # إعادة تعيين القائمة
+    added_channels = []
     async with bot.conversation(owner_id) as conv:
         await conv.send_message("- أرسل معرف القناة التي تريد إضافتها كقناة اشتراك (مثل: @M_D_I):")
         channel_username = (await conv.get_response(timeout=None)).text.strip()
         added_channels.append(channel_username)
-        await save_global_settings() # حفظ
+        await save_global_settings()
         await conv.send_message(f"- تم تعيين القناة التالية كقناة اشتراك إجباري: {channel_username}")
 
 @bot.on(events.CallbackQuery(data=b"list_vip"))
 async def list_vip(event):
     user_id = event.sender_id
-    if user_id != owner_id:
-        await event.answer("- هذه الميزة متاحة للمالك فقط.", alert=True)
-        return
-
+    if user_id != owner_id: return
     if not vip_users:
         await event.edit("- لا يوجد مستخدمون VIP حاليًا.", buttons=[[Button.inline("العودة", b"manage_vip")]])
     else:
         vip_list = "\n".join([f"- {vip_id}" for vip_id in vip_users])
-        await event.edit(
-            f"- قائمة المستخدمين VIP:\n\n{vip_list}",
-            buttons=[[Button.inline("العودة", b"manage_vip")]]
-        )
+        await event.edit(f"- قائمة المستخدمين VIP:\n\n{vip_list}", buttons=[[Button.inline("العودة", b"manage_vip")]])
 
 @bot.on(events.CallbackQuery(data=b"register"))
 async def register_account(event):
     user_id = event.sender_id
     await event.delete()
-    
     if str(user_id) not in users:
-        # إنشاء هيكل المستخدم إذا لم يكن موجوداً
         users[str(user_id)] = {"_id": user_id, "sessions": [], "groups": [], "posting": False}
-        
-    if user_id == owner_id or user_id in vip_users:
-        max_accounts = 10
-    else:
-        max_accounts = 1
-        
+    max_accounts = 10 if (user_id == owner_id or user_id in vip_users) else 1
     if len(users[str(user_id)]["sessions"]) >= max_accounts:
-        if user_id not in vip_users:
-            await bot.send_message(user_id, "- عذرًا، لا يمكنك إضافة أكثر من حساب واحد لأنك لست VIP.")
-            return
-        else:
-            await bot.send_message(user_id, f"- لقد وصلت إلى الحد الأقصى من الحسابات ({max_accounts}).")
-            return
+        await bot.send_message(user_id, f"- لقد وصلت إلى الحد الأقصى ({max_accounts}).")
+        return
             
     async with bot.conversation(user_id) as conv:
         await conv.send_message("- أرسل كود الجلسة الخاص بك:")
@@ -373,35 +342,25 @@ async def register_account(event):
             client = TelegramClient(StringSession(session_string), api_id, api_hash)
             try:
                 await client.connect()
-                if not await client.is_user_authorized():
-                    raise Exception("Auth Error")
+                if not await client.is_user_authorized(): raise Exception("Auth Error")
                 me = await client.get_me()
                 full_name = f"{me.first_name} {me.last_name}" if me.last_name else me.first_name
                 await conv.send_message(f"- تم تسجيل الدخول باستخدام الجلسة بنجاح! مرحبًا {full_name} .")
-                
-                users[str(user_id)]["sessions"].append({
-                    "session": session_string, 
-                    "username": me.username, 
-                    "id": me.id
-                })
-                await save_user(user_id) # حفظ
-            except Exception as e:
+                users[str(user_id)]["sessions"].append({"session": session_string, "username": me.username, "id": me.id})
+                await save_user(user_id)
+            except Exception:
                 await conv.send_message(f"- الجلسة غير صالحة استخرج واحده جديدة وحاول مجدداً")
-                return
             finally:
                 await client.disconnect()
         except asyncio.TimeoutError:
-            await conv.send_message("- لم يتم الرد في الوقت المحدد. تم إلغاء العملية.")
+            await conv.send_message("- لم يتم الرد في الوقت المحدد.")
 
 @bot.on(events.CallbackQuery(data=b"view_account"))
 async def view_account(event):
     user_id = event.sender_id
     sessions = users[str(user_id)].get("sessions", [])    
     if not sessions:
-        await event.edit(
-            "- لا توجد حسابات مسجلة حاليًا. قم بتسجيل حساب جديد.",
-            buttons=[[Button.inline("تسجيل حساب", b"register")]]
-        )
+        await event.edit("- لا توجد حسابات مسجلة.", buttons=[[Button.inline("تسجيل حساب", b"register")]])
         return
         
     accounts_info = []
@@ -413,19 +372,12 @@ async def view_account(event):
         try:
             client = TelegramClient(StringSession(session_string), api_id, api_hash)
             await client.connect()
-            if not await client.is_user_authorized():
-                raise Exception("Auth Error")
+            if not await client.is_user_authorized(): raise Exception("Auth Error")
             me = await client.get_me()
             full_name = f"{me.first_name} {me.last_name}" if me.last_name else me.first_name
-            phone = getattr(me, 'phone', 'Unknown')
-            accounts_info.append(
-                f"**الحساب {i+1}:**\n"
-                f"- **الاسم الكامل**: {full_name}\n"
-                f"- **ID**: {me.id}\n"
-                f"- **الرقم المرتبط**: {phone}"
-            )
+            accounts_info.append(f"**الحساب {i+1}:**\n- **الاسم**: {full_name}\n- **ID**: {me.id}")
             valid_sessions.append(session_data)
-        except Exception as e:
+        except Exception:
             accounts_info.append(f"**الحساب {i+1}:**\n- الجلسة غير صالحة وتم حذفها")
             has_changes = True
         finally:
@@ -433,90 +385,52 @@ async def view_account(event):
             
     if has_changes:
         users[str(user_id)]["sessions"] = valid_sessions
-        await save_user(user_id) # حفظ التعديلات
+        await save_user(user_id)
 
-    accounts_info_text = "\n\n".join(accounts_info)
-    await event.edit(
-        f"- الحسابات الحالية:\n\n{accounts_info_text}",
-        buttons=[[Button.inline("العودة", b"home")]]
-    )
+    await event.edit(f"- الحسابات الحالية:\n\n" + "\n\n".join(accounts_info), buttons=[[Button.inline("العودة", b"home")]])
 
 @bot.on(events.CallbackQuery(data=b"posting_settings"))
 async def posting_settings(event):
-    await event.edit(
-        "- إعدادات النشر:",
-        buttons=[
-            [Button.inline("تعيين الكليشة", b"newCaption"), Button.inline("الكليشة الثانية", b"newCaption2")],
-            [Button.inline("الكليشة الثالثة", b"newCaption3"), Button.inline("الكليشة الرابعة", b"newCaption4")],
-            [Button.inline("حذف الكلايش", b"deleteAllCaptions")],
-            [Button.inline("بدء النشر", b"startPosting"), Button.inline("إيقاف النشر", b"stopPosting")],
-            [Button.inline("تعيين وقت الانتظار", b"waitTime")],
-            [Button.inline("العودة", b"home")]
-        ]
-    )
+    await event.edit("- إعدادات النشر:", buttons=[
+        [Button.inline("تعيين الكليشة", b"newCaption"), Button.inline("الكليشة الثانية", b"newCaption2")],
+        [Button.inline("الكليشة الثالثة", b"newCaption3"), Button.inline("الكليشة الرابعة", b"newCaption4")],
+        [Button.inline("حذف الكلايش", b"deleteAllCaptions")],
+        [Button.inline("بدء النشر", b"startPosting"), Button.inline("إيقاف النشر", b"stopPosting")],
+        [Button.inline("تعيين وقت الانتظار", b"waitTime")],
+        [Button.inline("العودة", b"home")]
+    ])
 
 @bot.on(events.CallbackQuery(data=b"deleteAllCaptions"))
 async def delete_all_captions(event):
     user_id = event.sender_id
-    users[str(user_id)]["caption_1"] = ""
-    users[str(user_id)]["caption_2"] = ""
-    users[str(user_id)]["caption_3"] = ""
-    users[str(user_id)]["caption_4"] = ""
+    for i in range(1, 5): users[str(user_id)][f"caption_{i}"] = ""
     await save_user(user_id)
     await bot.send_message(user_id, "- تم مسح جميع الكلايش بنجاح!")
 
-@bot.on(events.CallbackQuery(data=b"newCaption"))
-async def new_caption(event):
+async def set_caption(event, key, msg):
     user_id = event.sender_id
     await event.delete()
     async with bot.conversation(user_id) as conv:
-        await conv.send_message("- أرسل الكليشة الجديدة:") 
-        caption_1 = (await conv.get_response(timeout=None)).text 
-        users[str(user_id)]["caption_1"] = caption_1
+        await conv.send_message(f"- أرسل {msg}:") 
+        val = (await conv.get_response(timeout=None)).text 
+        users[str(user_id)][key] = val
         await save_user(user_id)
-        await bot.send_message(user_id, f"- تم تحديث الكليشة بنجاح! الكليشة الجديدة هي: {caption_1}")
-        
-@bot.on(events.CallbackQuery(data=b"newCaption2"))
-async def new_caption2(event):
-    user_id = event.sender_id
-    if not is_vip(user_id):
-        await bot.send_message(user_id, "- عذرًا، لا يمكنك تحديد أكثر من كليشة لأنك لست VIP.")
-        return
-    await event.delete()
-    async with bot.conversation(user_id) as conv:
-        await conv.send_message("- أرسل الكليشة الثانية الجديدة:")
-        caption_2 = (await conv.get_response(timeout=None)).text 
-        users[str(user_id)]["caption_2"] = caption_2 
-        await save_user(user_id)
-        await bot.send_message(user_id, f"- تم تحديث الكليشة الثانية بنجاح! الكليشة الثانية الجديدة هي: {caption_2}")
+        await bot.send_message(user_id, f"- تم تحديث {msg} بنجاح!")
 
+@bot.on(events.CallbackQuery(data=b"newCaption"))
+async def new_caption(event): await set_caption(event, "caption_1", "الكليشة الجديدة")
+@bot.on(events.CallbackQuery(data=b"newCaption2"))
+async def new_caption2(event): 
+    if not is_vip(event.sender_id): return await bot.send_message(event.sender_id, "للمشتركين VIP فقط")
+    await set_caption(event, "caption_2", "الكليشة الثانية")
 @bot.on(events.CallbackQuery(data=b"newCaption3"))
 async def new_caption3(event):
-    user_id = event.sender_id
-    if not is_vip(user_id):
-        await bot.send_message(user_id, "- عذرًا، لا يمكنك تحديد أكثر من كليشة لأنك لست VIP.")
-        return
-    await event.delete()
-    async with bot.conversation(user_id) as conv:
-        await conv.send_message("- أرسل الكليشة الثالثة الجديدة:")
-        caption_3 = (await conv.get_response(timeout=None)).text 
-        users[str(user_id)]["caption_3"] = caption_3 
-        await save_user(user_id)
-        await bot.send_message(user_id, f"- تم تحديث الكليشة الثالثة بنجاح! الكليشة الثالثة الجديدة هي: {caption_3}")
-
+    if not is_vip(event.sender_id): return await bot.send_message(event.sender_id, "للمشتركين VIP فقط")
+    await set_caption(event, "caption_3", "الكليشة الثالثة")
 @bot.on(events.CallbackQuery(data=b"newCaption4"))
 async def new_caption4(event):
-    user_id = event.sender_id
-    if not is_vip(user_id):
-        await bot.send_message(user_id, "- عذرًا، لا يمكنك تحديد أكثر من كليشة لأنك لست VIP.")
-        return
-    await event.delete()
-    async with bot.conversation(user_id) as conv:
-        await conv.send_message("- أرسل الكليشة الرابعة الجديدة:")
-        caption_4 = (await conv.get_response(timeout=None)).text 
-        users[str(user_id)]["caption_4"] = caption_4
-        await save_user(user_id)
-        await bot.send_message(user_id, f"- تم تحديث الكليشة الرابعة بنجاح! الكليشة الرابعة الجديدة هي: {caption_4}")
+    if not is_vip(event.sender_id): return await bot.send_message(event.sender_id, "للمشتركين VIP فقط")
+    await set_caption(event, "caption_4", "الكليشة الرابعة")
 
 @bot.on(events.CallbackQuery(data=b"waitTime"))
 async def wait_time(event):
@@ -524,111 +438,65 @@ async def wait_time(event):
     await event.delete()
     async with bot.conversation(user_id) as conv:
         await conv.send_message("- أرسل مدة الانتظار (بالثواني):")
-        wait_txt = (await conv.get_response(timeout=None)).text
         try:
-            wait_val = int(wait_txt)
-            if wait_val <= 59:
-                raise ValueError("القيمة يجب أن تكون أكبر من دقيقة.")
+            wait_val = int((await conv.get_response(timeout=None)).text)
+            if wait_val <= 59: raise ValueError
             users[str(user_id)]["waitTime"] = wait_val
             await save_user(user_id)
-            await bot.send_message(user_id, f"- تم تعيين وقت الانتظار بنجاح: {wait_val} ثواني")
-        except ValueError as e:
-            await bot.send_message(user_id, f"القيمة يجب أن تكون أكبر من دقيقة.")
+            await bot.send_message(user_id, f"- تم تعيين الوقت: {wait_val} ثواني")
+        except ValueError:
+            await bot.send_message(user_id, "يجب أن تكون القيمة رقم وأكبر من 60.")
 
 @bot.on(events.CallbackQuery(data=b"startPosting"))
 async def start_posting(event):
     user_id = event.sender_id
-    
-    if str(user_id) not in users:
-        await event.answer("- المستخدم غير موجود!", alert=True)
-        return
+    if str(user_id) not in users: return await event.answer("خطأ بالمستخدم", alert=True)
         
     users[str(user_id)]["posting"] = True
     await save_user(user_id)
-    await event.answer("- تم بدء النشر التلقائي لجميع الحسابات!")
+    await event.answer("- تم بدء النشر التلقائي!")
     
-    if not users[str(user_id)].get("sessions"):
-        await event.answer("- لا توجد حسابات مضافة للنشر فيها.", alert=True)
-        users[str(user_id)]["posting"] = False
-        await save_user(user_id)
-        return
-    
+    captions = [users[str(user_id)].get(f"caption_{i}", "") for i in range(1, 5)]
+    captions = [c for c in captions if c]
     groups = users[str(user_id)].get("groups", [])
-    if not groups:
-        await event.answer("- لا توجد سوبرات مضافة للنشر فيها.", alert=True)
+    sessions = users[str(user_id)].get("sessions", [])
+
+    if not sessions or not groups or not captions:
         users[str(user_id)]["posting"] = False
         await save_user(user_id)
-        return
-        
-    captions = [
-        users[str(user_id)].get("caption_1", ""),
-        users[str(user_id)].get("caption_2", ""),
-        users[str(user_id)].get("caption_3", ""),
-        users[str(user_id)].get("caption_4", "")
-    ]
-    captions = [caption for caption in captions if caption]
-    
-    if not captions:
-        await event.answer("- لا توجد كليشة لنشرها.", alert=True)
-        return
+        return await event.answer("- تأكد من إضافة حسابات، سوبرات، وكلايش.", alert=True)
 
-    wait_time_val = users[str(user_id)].get("waitTime", 60)
+    wait_val = users[str(user_id)].get("waitTime", 60)
     
     async def post_in_group(session_string, group):
         client = TelegramClient(StringSession(session_string), api_id, api_hash)
         try:
             await client.connect()
-            if not await client.is_user_authorized():
-                raise Exception("Auth Error")
-            
-            try:
-                await client.send_message("me", "✅ تم تشغيل الجلسة بنجاح.")
-            except: pass
-            
+            if not await client.is_user_authorized(): raise Exception("Auth")
             while users[str(user_id)]["posting"]:
                 for caption in captions:
                     if not users[str(user_id)]["posting"]: break 
                     try:
                         if group.startswith("https://t.me/"):
-                            try:
-                                await client(JoinChannelRequest(group))
-                                await client.send_message(group, caption)
-                            except ChannelPrivateError:
-                                if group in users[str(user_id)]["groups"]:
-                                    users[str(user_id)]["groups"].remove(group)
-                                    await save_user(user_id)
-                                continue
-                            except UserBannedInChannelError:
-                                if group in users[str(user_id)]["groups"]:
-                                    users[str(user_id)]["groups"].remove(group)
-                                    await save_user(user_id)
-                                continue
-                        else:
-                            await client.send_message(group, caption)
+                            await client(JoinChannelRequest(group))
+                        await client.send_message(group, caption)
                     except FloodWaitError as e:
                         await asyncio.sleep(e.seconds)
+                    except (ChannelPrivateError, UserBannedInChannelError):
+                        if group in users[str(user_id)]["groups"]:
+                            users[str(user_id)]["groups"].remove(group)
+                            await save_user(user_id)
                     except Exception as e:
-                        print(f"Error posting in {group}: {e}")
-                
-                await asyncio.sleep(wait_time_val)
-        except Exception as e:
-            # حذف الجلسة إذا كانت تالفة
-            print(f"Session Error: {e}")
-            current_sessions = users[str(user_id)]["sessions"]
-            new_sessions = [s for s in current_sessions if s["session"] != session_string]
-            if len(current_sessions) != len(new_sessions):
-                users[str(user_id)]["sessions"] = new_sessions
-                await save_user(user_id)
+                        print(f"Error: {e}")
+                await asyncio.sleep(wait_val)
+        except Exception:
+            current = users[str(user_id)]["sessions"]
+            users[str(user_id)]["sessions"] = [s for s in current if s["session"] != session_string]
+            await save_user(user_id)
         finally:
             await client.disconnect()
 
-    tasks = []
-    for session_data in users[str(user_id)]["sessions"]:
-        session_string = session_data["session"]
-        for group in groups:
-            tasks.append(post_in_group(session_string, group))
-    
-    # تشغيل المهام في الخلفية
+    tasks = [post_in_group(s["session"], g) for s in sessions for g in groups]
     asyncio.create_task(asyncio.gather(*tasks))
 
 @bot.on(events.CallbackQuery(data=b"stopPosting"))
@@ -636,26 +504,19 @@ async def stop_posting(event):
     user_id = event.sender_id
     users[str(user_id)]["posting"] = False
     await save_user(user_id) 
-    await event.answer("- تم إيقاف النشر التلقائي!")
-    
+    await event.answer("- تم إيقاف النشر!")
+
 @bot.on(events.CallbackQuery(data=b"stats"))
 async def stats(event):
-    if event.sender_id == owner_id:
-        total_users = len(users)
-        total_groups = sum(len(user.get("groups", [])) for user in users.values())
-        total_accounts = sum(len(user.get("sessions", [])) for user in users.values())
+    if event.sender_id != owner_id: return
+    await event.edit(
+        f"- المستخدمين: {len(users)}\n"
+        f"- السوبرات: {sum(len(u.get('groups', [])) for u in users.values())}\n"
+        f"- الحسابات: {sum(len(u.get('sessions', [])) for u in users.values())}",
+        buttons=[[Button.inline("العودة", b"home")]]
+    )
 
-        await event.edit(
-            f"- عدد المستخدمين: {total_users}\n"
-            f"- عدد السوبرات: {total_groups}\n"
-            f"- عدد الحسابات المسجلة: {total_accounts}",
-            buttons=[[Button.inline("العودة", b"home")]]
-        )
-    else:
-        await event.answer("- هذه الميزة متاحة للمالك فقط.", alert=True)
-
-# نقطة الدخول الرئيسية (Entry Point)
 if __name__ == '__main__':
     bot.loop.run_until_complete(load_data_from_db())
-    print("Bot is running with MongoDB...")
+    print("Bot is running...")
     bot.run_until_disconnected()
