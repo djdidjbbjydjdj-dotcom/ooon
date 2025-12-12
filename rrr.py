@@ -12,7 +12,7 @@ import certifi #  ضروري لحل مشكلة SSL
 # --- إعدادات الاتصال ---
 api_id = 28557217
 api_hash = "22fb694b8c569117cc056073fc444597"
-bot_token = "7239771660:AAEmxmo5l8TN1QsRccCtnb_FS6EP_2HfsV4"
+bot_token = "6872922603:AAEckw1ILOGNhq9fYQB8L-bK_DAHdSNCue0"
 owner_id = 6646631745
 
 # رابط الاتصال (تم تصحيحه)
